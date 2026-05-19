@@ -99,6 +99,7 @@ public class Broker {
         pool.submit(this::acceptLoop);
         pool.submit(this::heartbeatLoop);
         pool.submit(this::failureDetectionLoop);
+        pool.submit(this::partialMatchCleanupLoop);
     }
 
     public void stop() {
@@ -147,10 +148,11 @@ public class Broker {
             case PUBLICATION  -> handlePublication(env.getPublication());
             case SUBSCRIPTION -> handleSubscription(env.getSubscription(),
                                                      env.getSenderId());
-            case PARTIAL_MATCH -> handlePartialMatch(env.getPartialMatch());
+            case BATCH_PARTIAL_MATCH -> handleBatchPartialMatch(env.getBatchPartialMatch(),
+                                                                env.getSenderId());
             case HEARTBEAT    -> handleHeartbeat(env.getHeartbeat());
             case BROKER_STATE -> handleBrokerState(env.getBrokerState());
-            default           -> {}
+            default           -> {}  // PARTIAL_MATCH (legacy single-sub) no longer used
         }
     }
 
@@ -159,66 +161,63 @@ public class Broker {
     // ══════════════════════════════════════════════════════════════════════════
 
     private void handlePublication(Publication pub) {
-        // For each subscription this broker holds predicates for,
-        // check if OUR predicates match. Serial stream avoids the per-publication
-        // ForkJoinPool task explosion (10k entries x N pub/s) that GC-thrashes the heap.
-        // The broker workPool already provides connection-level parallelism upstream.
-        myPredicates.entrySet().stream().forEach(entry -> {
+        // ── ENTRY-BROKER LOGIC ────────────────────────────────────────────────
+        // Publications arrive here ONLY from publishers (peer brokers forward
+        // publications via BATCH_PARTIAL_MATCH envelopes instead).
+        //
+        // Strategy: evaluate own predicates locally, then forward the pub ONCE
+        // to each peer via a single BATCH_PARTIAL_MATCH envelope. Peers vote
+        // back with their matches in another single envelope per peer.
+        //
+        // Per-pub network cost: 2 forwards + ≤2 vote responses = 4 envelopes.
+        // (Previous design: O(matches) envelopes per pub → 1800+ at 10k subs.)
+
+        // 1. Local evaluation of own predicates.
+        for (Map.Entry<String, List<Predicate>> entry : myPredicates.entrySet()) {
             String subId       = entry.getKey();
             List<Predicate> ps = entry.getValue();
 
-            boolean myMatch = ps.stream().allMatch(p -> matchPredicate(pub, p));
-            if (!myMatch) return;
+            if (!ps.stream().allMatch(p -> matchPredicate(pub, p))) continue;
 
-            // Our predicates matched — send PartialMatch to coordinate with other brokers
             Subscription sub = subscriptions.get(subId);
-            if (sub == null) return;
+            if (sub == null) continue;
 
-            // Fast path: if we own ALL predicates for this subscription, no need
-            // to involve peers at all. Deliver the notification directly.
-            // This is the common case in 100%-equality scenarios where every
-            // sub has a single predicate on a single field owned by one broker,
-            // and avoids a 10k×2-peer envelope fan-out per publication.
+            // Fast path: we own all of this sub's predicates — deliver directly,
+            // no peer coordination needed (typical for 100%-equality on owned field).
             if (ps.size() == sub.getPredicatesCount()) {
                 deliverNotification(sub, pub);
-                return;
+                continue;
             }
 
+            // Otherwise register a partial-match state seeded with our own
+            // matched fields. Peer votes will be merged here when they arrive.
             String corrId = pub.getId() + ":" + subId;
-
-            PartialMatch pm = PartialMatch.newBuilder()
-                    .setPublicationId(pub.getId())
-                    .setSubscriptionId(subId)
-                    .setSubscriberId(sub.getSubscriberId())
-                    .addAllMatchedFields(ownedFields.stream()
-                            .filter(f -> ps.stream().anyMatch(p -> p.getField().equals(f)))
-                            .toList())
-                    .setPublication(pub)
-                    .setEmitTimestamp(pub.getTimestamp())
-                    .build();
-
-            Envelope env = Envelope.newBuilder()
-                    .setType(Envelope.Type.PARTIAL_MATCH)
-                    .setSenderId(id)
-                    .setCorrelationId(corrId)
-                    .setPartialMatch(pm)
-                    .build();
-
-            // Register our own vote in the partial match state
             PartialMatchState state = partialMatches.computeIfAbsent(corrId,
                     k -> new PartialMatchState(sub, pub));
-            state.addVote(id, ownedFields);
+            Set<String> myFields = ownedFields.stream()
+                    .filter(f -> ps.stream().anyMatch(p -> p.getField().equals(f)))
+                    .collect(java.util.stream.Collectors.toSet());
+            state.matchedFields.addAll(myFields);
+            // Cannot deliver yet — sub has predicates on other brokers; wait for votes.
+        }
 
-            // Forward to all peers so they can add their votes
-            for (Config.BrokerAddress peer : peers) {
-                PersistentSender.send(peer.host(), peer.port(), env);
-            }
-
-            // We are the coordinator (entry broker for this publication).
-            // Only the coordinator delivers the final notification once all
-            // votes arrive — peers must NOT deliver (handlePartialMatch enforces).
-            checkAndDeliver(corrId, state);
-        });
+        // 2. Forward the publication to every peer for their independent match
+        //    pass. Empty matches list signals "this is a forward, please evaluate
+        //    and vote back".
+        if (peers.isEmpty()) return;
+        BatchPartialMatch forward = BatchPartialMatch.newBuilder()
+                .setPublication(pub)
+                .setEmitTimestamp(pub.getTimestamp())
+                .setIsResponse(false)
+                .build();
+        Envelope env = Envelope.newBuilder()
+                .setType(Envelope.Type.BATCH_PARTIAL_MATCH)
+                .setSenderId(id)
+                .setBatchPartialMatch(forward)
+                .build();
+        for (Config.BrokerAddress peer : peers) {
+            PersistentSender.send(peer.host(), peer.port(), env);
+        }
     }
 
     // ── Predicate matching (plain or encrypted) ───────────────────────────────
@@ -233,55 +232,57 @@ public class Broker {
     //  Partial match coordination
     // ══════════════════════════════════════════════════════════════════════════
 
-    private void handlePartialMatch(PartialMatch pm) {
-        String corrId = pm.getPublicationId() + ":" + pm.getSubscriptionId();
-        Subscription sub = subscriptions.get(pm.getSubscriptionId());
-        if (sub == null) return;
+    // ── Batched broker-to-broker partial match ────────────────────────────────
+    // is_response==false : forward from coordinator to peer (publication only)
+    // is_response==true  : peer's vote back to coordinator (publication + matches)
+    private void handleBatchPartialMatch(BatchPartialMatch batch, String senderId) {
+        if (!batch.getIsResponse()) {
+            // ── PEER ROLE: evaluate own predicates against the forwarded pub. ──
+            Publication pub = batch.getPublication();
+            List<MatchedSub> votes = new ArrayList<>();
+            for (Map.Entry<String, List<Predicate>> entry : myPredicates.entrySet()) {
+                String subId       = entry.getKey();
+                List<Predicate> ps = entry.getValue();
+                if (!ps.stream().allMatch(p -> matchPredicate(pub, p))) continue;
 
-        // Check if WE have predicates for this subscription
-        List<Predicate> myPs = myPredicates.get(pm.getSubscriptionId());
+                List<String> myFields = ownedFields.stream()
+                        .filter(f -> ps.stream().anyMatch(p -> p.getField().equals(f)))
+                        .toList();
+                votes.add(MatchedSub.newBuilder()
+                        .setSubscriptionId(subId)
+                        .addAllMatchedFields(myFields)
+                        .build());
+            }
 
-        // If we have predicates, evaluate them. The PartialMatch envelope
-        // carries the publication content so we can match without lookup.
-        // We DO NOT deliver from this handler — only the coordinator (the
-        // broker that received the PUBLICATION) delivers, to prevent the
-        // duplicate-notification storm that previously fan-out a single
-        // publication into 3x notifications.
-        if (myPs != null && !myPs.isEmpty()) {
-            boolean myMatch = myPs.stream().allMatch(p -> matchPredicate(pm.getPublication(), p));
-            if (!myMatch) return;
-
-            // Send back a PartialMatch (vote) to the coordinator so it can
-            // tally votes and deliver once all predicates are matched.
-            // Reusing PartialMatch envelope shape: the sender field tells the
-            // coordinator which broker is voting.
-            PartialMatch ack = PartialMatch.newBuilder()
-                    .setPublicationId(pm.getPublicationId())
-                    .setSubscriptionId(pm.getSubscriptionId())
-                    .setSubscriberId(pm.getSubscriberId())
-                    .addAllMatchedFields(ownedFields.stream()
-                            .filter(f -> myPs.stream().anyMatch(p -> p.getField().equals(f)))
-                            .toList())
-                    .setPublication(pm.getPublication())
-                    .setEmitTimestamp(pm.getEmitTimestamp())
+            // Always respond, even when votes is empty, so the coordinator can
+            // make progress and (eventually) prune state.
+            BatchPartialMatch response = BatchPartialMatch.newBuilder()
+                    .setPublication(pub)
+                    .setEmitTimestamp(batch.getEmitTimestamp())
+                    .setIsResponse(true)
+                    .addAllMatches(votes)
                     .build();
             Envelope env = Envelope.newBuilder()
-                    .setType(Envelope.Type.PARTIAL_MATCH)
+                    .setType(Envelope.Type.BATCH_PARTIAL_MATCH)
                     .setSenderId(id)
-                    .setCorrelationId(corrId)
-                    .setPartialMatch(ack)
+                    .setBatchPartialMatch(response)
                     .build();
-            // Route the vote to the coordinator (the original sender of pm).
-            for (Config.BrokerAddress peer : peers) {
-                // Skip self; only forward to the broker that originated the PartialMatch.
-                // The coordinator collects votes via partialMatches.
-                PersistentSender.send(peer.host(), peer.port(), env);
+            Config.BrokerAddress coord = peerById(senderId);
+            if (coord != null) {
+                PersistentSender.send(coord.host(), coord.port(), env);
             }
-        } else {
-            // No predicates here — we're the coordinator receiving a peer's vote.
+            return;
+        }
+
+        // ── COORDINATOR ROLE: merge peer votes into per-(pub,sub) state. ──
+        Publication pub = batch.getPublication();
+        for (MatchedSub ms : batch.getMatchesList()) {
+            Subscription sub = subscriptions.get(ms.getSubscriptionId());
+            if (sub == null) continue;
+            String corrId = pub.getId() + ":" + ms.getSubscriptionId();
             PartialMatchState state = partialMatches.computeIfAbsent(corrId,
-                    k -> new PartialMatchState(sub, pm.getPublication()));
-            state.addExternalVote(pm.getMatchedFieldsList());
+                    k -> new PartialMatchState(sub, pub));
+            state.matchedFields.addAll(ms.getMatchedFieldsList());
             checkAndDeliver(corrId, state);
         }
     }
@@ -295,6 +296,31 @@ public class Broker {
             // All predicates matched across all brokers — deliver!
             partialMatches.remove(corrId);
             deliverNotification(sub, state.publication);
+        }
+    }
+
+    // Lookup a peer broker by id; returns null if not a peer.
+    private Config.BrokerAddress peerById(String brokerId) {
+        for (Config.BrokerAddress p : peers) {
+            if (p.id().equals(brokerId)) return p;
+        }
+        return null;
+    }
+
+    // Evicts partial-match state older than 30s. Bounds memory in adversarial
+    // scenarios (e.g., a sub with predicates that partially match but never
+    // accumulate enough votes for delivery, or a peer broker that crashes
+    // mid-flow without sending its vote).
+    private void partialMatchCleanupLoop() {
+        while (running) {
+            try {
+                Thread.sleep(5_000);
+                long cutoff = System.currentTimeMillis() - 30_000;
+                partialMatches.entrySet().removeIf(e -> e.getValue().createdAt < cutoff);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
     }
 
@@ -476,18 +502,11 @@ public class Broker {
         final Subscription subscription;
         final Publication  publication;
         final Set<String>  matchedFields = ConcurrentHashMap.newKeySet();
+        final long         createdAt = System.currentTimeMillis();
 
         PartialMatchState(Subscription sub, Publication pub) {
             this.subscription = sub;
             this.publication  = pub;
-        }
-
-        void addVote(String brokerId, Set<String> fields) {
-            matchedFields.addAll(fields);
-        }
-
-        void addExternalVote(List<String> fields) {
-            matchedFields.addAll(fields);
         }
     }
 

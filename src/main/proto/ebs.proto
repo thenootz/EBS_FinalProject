@@ -48,9 +48,10 @@ message Envelope {
         SUBSCRIPTION       = 1;
         NOTIFICATION       = 2;
         HEARTBEAT          = 3;
-        PARTIAL_MATCH      = 4;   // broker-to-broker coordination
+        PARTIAL_MATCH      = 4;   // broker-to-broker coordination (legacy per-sub)
         BROKER_STATE       = 5;   // fault tolerance: state replication
         ACK                = 6;
+        BATCH_PARTIAL_MATCH = 7;  // broker-to-broker coordination (batched per pub)
     }
     Type   type          = 1;
     string sender_id     = 2;
@@ -64,6 +65,7 @@ message Envelope {
         PartialMatch partial_match = 8;
         BrokerState  broker_state  = 9;
         Ack          ack           = 10;
+        BatchPartialMatch batch_partial_match = 11;
     }
 }
 
@@ -98,4 +100,19 @@ message BrokerState {
 message Ack {
     string ref_id  = 1;
     bool   success = 2;
+}
+
+// ── Batched partial match (one envelope carries many subs for the same pub) ──
+// Used to amortise envelope overhead during pipelined matching at scale.
+// Direction flag distinguishes coordinator->peer forward from peer->coordinator vote.
+message MatchedSub {
+    string subscription_id           = 1;
+    repeated string matched_fields   = 2;
+}
+
+message BatchPartialMatch {
+    Publication publication      = 1;
+    repeated MatchedSub matches  = 2;
+    int64 emit_timestamp         = 3;
+    bool  is_response            = 4;   // false = coordinator->peer; true = peer->coordinator
 }
