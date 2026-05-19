@@ -76,8 +76,17 @@ public class Broker {
     // ══════════════════════════════════════════════════════════════════════════
 
     // ── Work queue executor for envelope processing ──────────────────────────
-    private final ExecutorService workPool = Executors.newFixedThreadPool(
-            Math.max(4, Runtime.getRuntime().availableProcessors()));
+    // Bounded queue + CallerRunsPolicy: when the queue fills, the reader thread
+    // runs the task inline, which throttles the TCP socket reads and creates
+    // natural back-pressure to upstream senders. The previous unbounded
+    // newFixedThreadPool queue accumulated envelopes indefinitely under load,
+    // causing OutOfMemoryError on the 180s × 10k-subscription evaluation.
+    private final ExecutorService workPool = new ThreadPoolExecutor(
+            Math.max(4, Runtime.getRuntime().availableProcessors()),
+            Math.max(4, Runtime.getRuntime().availableProcessors()),
+            0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(2048),
+            new ThreadPoolExecutor.CallerRunsPolicy());
 
     public void start() throws IOException {
         serverSocket = new ServerSocket();
