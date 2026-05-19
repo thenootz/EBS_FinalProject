@@ -75,28 +75,32 @@ O subscripție `{(company,=,"Google"); (value,>=,90); (variation,<,0.8)}` este d
 
 ---
 
-# Slide 5 — Pipeline de matching
+# Slide 5 — Pipeline de matching (batched)
 
 ```
 Publication
     │
-    ▼
-[broker-1] verifică predicatele de "value"  ──► PartialMatch
+    ▼  (round-robin)
+[broker-1 = entry] evaluează predicatele câmpurilor proprii ("value")
+    │   └─ fast path: dacă brokerul deține TOATE predicatele → livrează direct
     │
-    ▼
-[broker-2] verifică predicatele de "variation"  ──► PartialMatch
-    │
-    ▼
-[broker-3] verifică predicatele de "company"  ──► PartialMatch
-    │
-    ▼
-Coordonator agregează voturile (correlationId)
-    │
-    ▼
-Toate predicatele match? → Notificare către Subscriber
+    ├──· BatchPartialMatch(pub, is_response=false) → broker-2
+    └──· BatchPartialMatch(pub, is_response=false) → broker-3
+                       │                              │
+                       ▼                              ▼
+              [broker-2] evaluează          [broker-3] evaluează
+              "date" + "variation"          "drop" + "company"
+                       │                              │
+                       ▼ BatchPartialMatch(is_response=true, [MatchedSub...])
+                       └────────┬───────────────────────────────────────────┘
+                               ▼
+               [broker-1] (coordinator) agregă voturile
+                               │
+                               ▼
+               Toate predicatele match? → Notification către Subscriber
 ```
 
-**Niciun broker nu face singur tot matching-ul** — fiecare procesează doar câmpurile sale.
+**Volum rețea:** doar **4 envelope inter-broker per publicație** (2 forward + 2 vote-uri), indiferent de numărul de subscripții potrivite. Niciun broker nu face singur tot matching-ul — fiecare procesează doar câmpurile sale.
 
 ---
 
@@ -105,15 +109,24 @@ Toate predicatele match? → Notificare către Subscriber
 Schema `ebs.proto`:
 ```protobuf
 message Envelope {
-  enum Type { PUBLICATION, SUBSCRIPTION, NOTIFICATION,
-              HEARTBEAT, PARTIAL_MATCH, BROKER_STATE }
+  enum Type {
+    PUBLICATION = 0; SUBSCRIPTION = 1; NOTIFICATION = 2;
+    HEARTBEAT = 3;   PARTIAL_MATCH = 4;  // legacy per-sub
+    BROKER_STATE = 5; ACK = 6;
+    BATCH_PARTIAL_MATCH = 7;             // batched per pub
+  }
   Type type = 1;
+  string sender_id    = 2;
+  string correlation_id = 3;
   oneof payload {
-    Publication  publication  = 4;
-    Subscription subscription = 5;
-    Notification notification = 6;
-    Heartbeat    heartbeat    = 7;
-    ...
+    Publication       publication         = 4;
+    Subscription      subscription        = 5;
+    Notification      notification        = 6;
+    Heartbeat         heartbeat           = 7;
+    PartialMatch      partial_match       = 8;
+    BrokerState       broker_state        = 9;
+    Ack               ack                 = 10;
+    BatchPartialMatch batch_partial_match = 11;
   }
 }
 ```
@@ -130,11 +143,11 @@ message Envelope {
 
 **Mecanism:**
 1. Fiecare broker trimite **heartbeat la 2s** către peers
-2. Dacă un peer lipsește **>30s**, e marcat DEAD
+2. Dacă un peer lipsește **>60s** (cu grace period de 30s la pornire), e marcat DEAD
 3. Brokerii rămași **absorb subscripțiile** celui căzut (din replicas locale)
 4. Rerutare prin `ConsistentHashRouter.removeBroker()`
 
-**Demo:** `java ebs.Main --fault-test`
+**Demo:** `java -cp target/pubsub-1.0.jar ebs.Main --fault-test`
 - La t=10s, `broker-2` este oprit
 - Brokerii 1 și 3 detectează căderea și redistribuie
 
@@ -177,25 +190,32 @@ Subscripțiile cu "company" folosesc "=" 25%, "!=" 75%
 
 # Slide 10 — Rezultate evaluare
 
-| Metric                          | 100% =      | 25% =       |
-|---------------------------------|-------------|-------------|
-| Publicații trimise              | [VAL]       | [VAL]       |
-| Notificări livrate              | [VAL]       | [VAL]       |
-| **Rata potrivire (notif/pub)**  | **[VAL]**   | **[VAL]**   |
-| Latență medie (ms)              | [VAL]       | [VAL]       |
+| Metric                          | 100% =       | 25% =        |
+|---------------------------------|--------------|--------------|
+| Subscripții înregistrate         | 10 000       | 10 000       |
+| Timp înregistrare (ms)          | 875          | 392          |
+| Publicații trimise              | 1 800        | 1 800        |
+| Notificări livrate              | 812 441      | 3 296 943    |
+| **Rata potrivire (notif/pub)**  | **451.36**   | **1 831.64** |
+| Latență medie (ms)              | 25.04        | 40.34        |
 
 **Concluzie:**
-Scenariul B (25% =) produce mai multe matches deoarece predicatele `!=` sunt mai permissive (9/10 probabilitate vs 1/10 pentru `=`).
+- Scenariul B (25% =) produce **≈4× mai multe notificări** decât Scenariul A, fiindcă predicatele `!=` sunt mai permisive (9/10 valori se potrivesc, față de 1/10 pentru `=`).
+- Latența crește modest (×1.6) chiar și la o creștere de ×4 a fan-out-ului, validezând pipeline-ul batched + back-pressure-ul cu queue mărginită.
+- Detalii în `docs/EVALUATION_REPORT.md` (CSV brut + log run).
 
 ---
 
 # Slide 11 — Optimizări
 
-1. **PersistentSender** — pool de socket-uri TCP (un socket per destinație)
-2. **Thread pool per broker** — 4-8 worker threads
-3. **`parallelStream()`** pe matching subscripții
-4. **TCP_NODELAY + buffered streams** — latență mică
-5. **Heartbeat one-shot** — bypass la coada de mesaje
+1. **`BatchPartialMatch`** — o singură envelopă per peer per publicație (vs ~1 800 înainte), 4 envelope inter-broker per publicație indiferent de fan-out
+2. **PersistentSender** — pool de socket-uri TCP (un socket per destinație), evită handshake repetat
+3. **ThreadPoolExecutor cu `ArrayBlockingQueue(2048)` + CallerRunsPolicy** — back-pressure naturală, previne OOM-ul observat cu `Executors.newFixedThreadPool()`
+4. **TCP_NODELAY + BufferedOutputStream** — latență mică, throughput bun
+5. **Round-robin publisher → 1 broker entry** — elimină triplicarea volumului de intrare și livrările duplicate
+6. **Fast-path delivery** — când brokerul entry deține toate predicatele subscripției, livrează direct (fără round-trip cu peers)
+7. **Subscriber loop-read** cu `setSoTimeout(60s)` — reutilizează conexiunile primite de la brokeri, evită storm-ul de reconnect-uri
+8. **Heartbeat one-shot** — bypass la coada principală, evită fals-pozitive la congestiție
 
 ---
 
@@ -203,21 +223,21 @@ Scenariul B (25% =) produce mai multe matches deoarece predicatele `!=` sunt mai
 
 **Run-demo.sh:**
 ```bash
-./scripts/run-demo.sh
+./scripts/run-demo.sh demo
 ```
 
-1. Pornește 3 brokers
-2. Pornește 3 subscribers
+1. Pornește 3 brokers (porturi 5001-5003)
+2. Pornește 3 subscribers (porturi 7001-7003)
 3. Înregistrează 300 subscripții
-4. Pornește 2 publishers
+4. Pornește 2 publishers (round-robin la brokeri)
 5. Rulează 30 secunde
-6. Afișează statistici
+6. Afișează statistici (pubs/notifs/latență medie)
 
 **Ce vom vedea:**
-- Brokerii detectează câmpurile lor
-- Subscripțiile sunt distribuite
+- Brokerii își înregistrează câmpurile proprii
+- Subscripțiile sunt distribuite per câmp
 - Notificările curg către subscribers
-- Latențe sub 100 ms
+- Latențe sub 50 ms
 
 ---
 
@@ -238,10 +258,10 @@ Scenariul B (25% =) produce mai multe matches deoarece predicatele `!=` sunt mai
 
 # Slide 14 — Backup: Detalii implementare
 
-**Linii de cod:** ~1500 Java
-**Fișiere:** 14 clase Java + 1 schema Protobuf
-**Dependențe runtime:**
-- `protobuf-java` 3.21
+**Cod:** 14 clase Java + 1 schemă Protobuf (`ebs.proto`)
+**Build:** Maven → `target/pubsub-1.0.jar` shaded (~2 MB)
+**Dependențe runtime (incluse în jar):**
+- `protobuf-java` 3.25.1
 - `slf4j-api` + `slf4j-simple`
 
 **Suport multi-platform:** Linux, macOS, Windows (cu Java 17+)

@@ -85,13 +85,13 @@ Raportul măsurat B/A = **4.06×** confirmă că predicatele `!=` (75 % din scen
 
 ### b) Latența medie de livrare
 
-Latența totală includea în implementarea originală:
+Latența totală în implementarea curentă (cu pipeline batched) include:
 
 1. **Publisher → Broker** (~1 ms pe loopback)
 2. **Matching local pe broker** (serial pe 10k entries: ~0.5–2 ms)
 3. **Forward batched PartialMatch la peers** (1 envelopă per peer)
 4. **Peer evaluează propriile predicate și votează înapoi** (1 envelopă)
-5. **Coordinator agregă voturile, delivă notificarea** (~0.5 ms)
+5. **Coordinator agregă voturile, livrează notificarea** (~0.5 ms)
 6. **Broker → Subscriber notification** (~1 ms pe TCP persistent)
 
 **Latența măsurată:**
@@ -131,7 +131,7 @@ B / A      : 4.06×
 1. **Coordonarea cross-broker era bottleneck-ul inițial** — implementarea originală (un envelope `PartialMatch` per subscripție potrivită, per peer) genera ~1 800 envelope per publicație la 10 000 subs. Refactorizarea în `BatchPartialMatch` (1 envelope per peer per publicație) a fost necesară pentru a susține spec-ul 10k × 180 s pe hardware-ul disponibil. Fără batching, sistemul fie scotea OOM (cu coadă nemărginită) fie throughput-ul se prăbușea la <1 pub/s (cu backpressure).
 2. **Mecanism PartialMatch best-effort** — dacă un peer broker nu răspunde în 30 s, voturile rare orfane sunt evictate de cleanup loop și subscripția nu primește notificarea. La rulări normale (no crashes) acest comportament nu se manifestă.
 3. **Encryption mode** — operatorii de inegalitate (`<`, `>`, `<=`, `>=`) nu sunt suportați pe câmpuri criptate cu SHA-256; matcher-ul cripto suportă doar `=` și `!=`. Predicatele de range pe câmpuri criptate sunt ignorate (no match) pentru a păstra semantica zero-knowledge.
-4. **Heap 2 GB** — testarea a fost limitată la heap-ul disponibil; la 10k subs × 180 s, peak heap observat este ~600 MB, deci există margină pentru scări suplimentare în cazul în care `-Xmx4g`+ ar fi disponibil.
+4. **Heap 2 GB** — testarea a fost limitată la heap-ul disponibil; rularea a terminat normal fără `OutOfMemoryError`, dar utilizarea exactă a heap-ului nu a fost măsurată (necesită `-XX:+PrintGCDetails` sau JFR într-o rulare următoare). La nevoie, scările mai mari ar trebui rulate cu `-Xmx4g`+.
 
 ---
 
