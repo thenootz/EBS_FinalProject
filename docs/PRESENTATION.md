@@ -193,15 +193,15 @@ Subscripțiile cu "company" folosesc "=" 25%, "!=" 75%
 | Metric                          | 100% =       | 25% =        |
 |---------------------------------|--------------|--------------|
 | Subscripții înregistrate         | 10 000       | 10 000       |
-| Timp înregistrare (ms)          | 875          | 392          |
-| Publicații trimise              | 1 800        | 1 800        |
-| Notificări livrate              | 812 441      | 3 296 943    |
-| **Rata potrivire (notif/pub)**  | **451.36**   | **1 831.64** |
-| Latență medie (ms)              | 25.04        | 40.34        |
+| Timp înregistrare (ms)          | 711          | 391          |
+| Publicații trimise              | 1 798        | 1 798        |
+| Notificări livrate              | 803 303      | 3 233 151    |
+| **Rata potrivire (notif/pub)**  | **446.78**   | **1 798.19** |
+| Latență medie (ms)              | 31.07        | 33.39        |
 
 **Concluzie:**
 - Scenariul B (25% =) produce **≈4× mai multe notificări** decât Scenariul A, fiindcă predicatele `!=` sunt mai permisive (9/10 valori se potrivesc, față de 1/10 pentru `=`).
-- Latența crește modest (×1.6) chiar și la o creștere de ×4 a fan-out-ului, validezând pipeline-ul batched + back-pressure-ul cu queue mărginită.
+- Latența crește modest (×1.07) chiar și la o creștere de ×4 a fan-out-ului, validezând pipeline-ul batched + back-pressure-ul cu queue mărginită.
 - Detalii în `docs/EVALUATION_REPORT.md` (CSV brut + log run).
 
 ---

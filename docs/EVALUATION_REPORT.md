@@ -57,13 +57,13 @@
 | Metric                              | Scenariu A (100% =) | Scenariu B (25% =) |
 |-------------------------------------|---------------------|--------------------|
 | Subscripții înregistrate            | 10 000              | 10 000             |
-| Timp înregistrare subscripții (ms)  | 875                 | 392                |
-| Publicații trimise (3 min)          | 1 800               | 1 800              |
-| Notificări livrate                  | 812 441             | 3 296 943          |
-| **Rata de potrivire (notif/pub)**   | **451.36**          | **1 831.64**       |
-| Latență medie livrare (ms)          | 25.04               | 40.34              |
-| Throughput publicații (pub/s)       | 10.00               | 10.00              |
-| Throughput notificări (notif/s)     | 4 513.56            | 18 316.35          |
+| Timp înregistrare subscripții (ms)  | 711                 | 391                |
+| Publicații trimise (3 min)          | 1 798               | 1 798              |
+| Notificări livrate                  | 803 303             | 3 233 151          |
+| **Rata de potrivire (notif/pub)**   | **446.78**          | **1 798.19**       |
+| Latență medie livrare (ms)          | 31.07               | 33.39              |
+| Throughput publicații (pub/s)       | 9.99                | 9.99               |
+| Throughput notificări (notif/s)     | 4 462.79            | 17 961.95          |
 
 > Datele sunt extrase din `eval-results.csv` generat de o singură rulare
 > `java -Xmx2g -Dfeed.seconds=180 -Dtotal.subs=10000 -cp target/pubsub-1.0.jar ebs.EvalHarness`.
@@ -75,13 +75,13 @@
 
 ### a) Numărul de publicații livrate cu succes (3 min feed)
 
-Cu un interval de publicare de 200 ms per publisher × 2 publishers = 10 publicații/secundă × 180 secunde = **1 800 publicații trimise total** (verificat: ambele scenarii au atins exact 1 800, deci publisher-ii nu au fost încetiniți de backpressure).
+Cu un interval de publicare de 200 ms per publisher × 2 publishers = 10 publicații/secundă × 180 secunde = **1 800 publicații țintă**. Au fost înregistrate efectiv **1 798** în ambele scenarii (două publicații lipsă datorate scheduler-ului la capătul fereastrei de 180 s), deci publisher-ii nu au fost încetiniți de backpressure.
 
 Numărul de notificări livrate depinde de cât de selective sunt subscripțiile:
-- **Scenariul A (100% `=`)** → 812 441 notificări / 1 800 pub = **451 matches/pub** → ~4.5 % din 10 000 subscripții s-au potrivit cu o publicație tipică
-- **Scenariul B (25% `=`)** → 3 296 943 notificări / 1 800 pub = **1 832 matches/pub** → ~18.3 % din 10 000 subscripții s-au potrivit
+- **Scenariul A (100% `=`)** → 803 303 notificări / 1 798 pub = **446.78 matches/pub** → ~4.5 % din 10 000 subscripții s-au potrivit cu o publicație tipică
+- **Scenariul B (25% `=`)** → 3 233 151 notificări / 1 798 pub = **1 798.19 matches/pub** → ~18.0 % din 10 000 subscripții s-au potrivit
 
-Raportul măsurat B/A = **4.06×** confirmă că predicatele `!=` (75 % din scenariul B) sunt mult mai permisive decât `=`.
+Raportul măsurat B/A = **4.03×** confirmă că predicatele `!=` (75 % din scenariul B) sunt mult mai permisive decât `=`.
 
 ### b) Latența medie de livrare
 
@@ -95,16 +95,16 @@ Latența totală în implementarea curentă (cu pipeline batched) include:
 6. **Broker → Subscriber notification** (~1 ms pe TCP persistent)
 
 **Latența măsurată:**
-- Scenariul A: **25.04 ms** — majoritatea subscripțiilor cad pe fast-path (broker-3 deține `company`), evitând coordonarea cross-broker
-- Scenariul B: **40.34 ms** — amestec de predicate `=`/`!=` forțează mai multe delivări prin pipeline-ul batched, câteva ms peste sceenariul A
+- Scenariul A: **31.07 ms** — majoritatea subscripțiilor care conțin doar `company` cad pe fast-path (broker-3 deține `company`), evitând coordonarea cross-broker
+- Scenariul B: **33.39 ms** — amestec de predicate `=`/`!=` forțează mai multe delivări prin pipeline-ul batched, dar fan-out-ul de notificări (~4×) este absorbit elastic de coada mărginită, deci latența crește modest (≈7 % peste scenariul A)
 
 ### c) Comparația ratei de potrivire
 
 **Măsurat:**
 ```
-Scenariu A : 451.36 notificări / publicație
-Scenariu B : 1 831.64 notificări / publicație
-B / A      : 4.06×
+Scenariu A : 446.78 notificări / publicație
+Scenariu B : 1 798.19 notificări / publicație
+B / A      : 4.03×
 ```
 
 **Interpretare:** În scenariul B, 75 % din subscripțiile care conțin `company` folosesc `!=`. Predicatul `company != X` se satisface pentru orice publicație a cărei companie nu e `X`; cu un pool fix de companii, asta înseamnă o probabilitate de match per predicat de ordinul 80–90 %. Combinația cu celelalte 4 câmpuri trage rata finală la ~18 % din subscripții per publicație, față de ~4.5 % în scenariul A. Raportul de ~4× măsurat este coerent cu modelul probabilistic.
@@ -158,7 +158,7 @@ Sistemul implementat satisface toate cerințele de bază ale temei și include c
 ```
 ╔═══════════════════════════════════════════════════════════╗
 ║   EBS EVALUATION — 10000 subs, 180-second feed                  
-╚═══════════════════════════════════════════════════════════╝
+╚══════════════════════════════════════════════════════════════╝
 
 ━━━ SCENARIO A: 100% equality on 'company' ━━━
 [broker-1] owns fields: [value]
@@ -170,18 +170,18 @@ Sistemul implementat satisface toate cerințele de bază ale temei și include c
 [sub-1] listening for notifications on port 7001
 [sub-2] listening for notifications on port 7002
 [sub-3] listening for notifications on port 7003
-[broker-3] 2000 subscriptions stored
-[broker-2] 3000 subscriptions stored
-[broker-1] 3000 subscriptions stored
 [sub-1] registered 3333 subscriptions
-[broker-2] 4000 subscriptions stored
-[broker-3] 4000 subscriptions stored
-[broker-3] 5000 subscriptions stored
+[broker-1] 4000 subscriptions stored
+[broker-1] 5000 subscriptions stored
+[broker-1] 6000 subscriptions stored
+[broker-2] 6000 subscriptions stored
+[broker-3] 6000 subscriptions stored
 [sub-2] registered 3333 subscriptions
-[broker-1] 7000 subscriptions stored
 [broker-2] 7000 subscriptions stored
 [broker-3] 7000 subscriptions stored
+[broker-1] 7000 subscriptions stored
 [broker-2] 8000 subscriptions stored
+[broker-3] 8000 subscriptions stored
 [broker-1] 8000 subscriptions stored
 [sub-3] registered 3333 subscriptions
 
@@ -197,35 +197,33 @@ Sistemul implementat satisface toate cerințele de bază ale temei și include c
 [sub-1] listening for notifications on port 7001
 [sub-2] listening for notifications on port 7002
 [sub-3] listening for notifications on port 7003
-[broker-3] 2000 subscriptions stored
-[broker-1] 3000 subscriptions stored
-[broker-3] 3000 subscriptions stored
 [broker-2] 3000 subscriptions stored
 [sub-1] registered 3333 subscriptions
-[broker-3] 5000 subscriptions stored
+[broker-2] 4000 subscriptions stored
+[broker-1] 5000 subscriptions stored
+[broker-2] 6000 subscriptions stored
+[broker-1] 6000 subscriptions stored
 [broker-3] 6000 subscriptions stored
 [sub-2] registered 3333 subscriptions
-[broker-2] 7000 subscriptions stored
-[broker-3] 7000 subscriptions stored
-[broker-2] 8000 subscriptions stored
+[broker-1] 7000 subscriptions stored
 [broker-1] 9000 subscriptions stored
 [broker-3] 9000 subscriptions stored
 [sub-3] registered 3333 subscriptions
 
-╔═══════════════════════════════════════════════════════════╗
+╔══════════════════════════════════════════════════════════════╗
 ║                  EVALUATION REPORT                          ║
-╠═══════════════════════════════════════════════════════════╣
+╠══════════════════════════════════════════════════════════════╣
 ║  Subscriptions registered per scenario : 10,000              ║
 ║  Feed duration                         :  180 s              ║
-╠═══════════════════════════════════════════════════════════╣
+╠══════════════════════════════════════════════════════════════╣
 ║  Scenario              │ 100% EQ         │ 25% EQ           ║
 ║────────────────────────┼─────────────────┼──────────────────║
-║  Subs registration (ms)│          875   │          392     ║
-║  Publications sent     │         1800   │         1800     ║
-║  Notifications delivered│       812441   │      3296943     ║
-║  Avg notif/publication │       451.36   │      1831.64     ║
-║  Avg latency (ms)      │        25.04   │        40.34     ║
-╚═══════════════════════════════════════════════════════════╝
+║  Subs registration (ms)│          711   │          391     ║
+║  Publications sent     │         1798   │         1798     ║
+║  Notifications delivered│       803303   │      3233151     ║
+║  Avg notif/publication │       446.78   │      1798.19     ║
+║  Avg latency (ms)      │        31.07   │        33.39     ║
+╚══════════════════════════════════════════════════════════════╝
 → saved eval-results.csv
 ```
 
@@ -240,9 +238,9 @@ Sistemul implementat satisface toate cerințele de bază ale temei și include c
 metric,100%_equality,25%_equality
 subscriptions_registered,10000,10000
 feed_seconds,180,180
-registration_ms,875,392
-publications_sent,1800,1800
-notifications_delivered,812441,3296943
-notif_per_pub,451.3561,1831.6350
-avg_latency_ms,25.0431,40.3367
+registration_ms,711,391
+publications_sent,1798,1798
+notifications_delivered,803303,3233151
+notif_per_pub,446.7759,1798.1930
+avg_latency_ms,31.0660,33.3922
 ```

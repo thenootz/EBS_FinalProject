@@ -378,8 +378,8 @@ Pe Ubuntu / OpenJDK 21, mașină cu 4 cores, `-Xmx2g`:
 
 | Test | Subs | Pub interval | Durata | Pubs Sent | Notifs | Notif/pub | Avg Latency |
 |---|---|---|---|---|---|---|---|
-| eval 100% EQ | 10 000 | 200 ms | 180 s | 1 800 | 812 441 | 451.36 | 25.04 ms |
-| eval 25% EQ | 10 000 | 200 ms | 180 s | 1 800 | 3 296 943 | 1 831.64 | 40.34 ms |
+| eval 100% EQ | 10 000 | 200 ms | 180 s | 1 798 | 803 303 | 446.78 | 31.07 ms |
+| eval 25% EQ | 10 000 | 200 ms | 180 s | 1 798 | 3 233 151 | 1 798.19 | 33.39 ms |
 | smoke 2k | 2 000 | 200 ms | 30 s | 300 | 26 721 | 89.07 | 5.58 ms |
 
 Istoric (pre-refactor, container limitat — rămas pentru referință):
