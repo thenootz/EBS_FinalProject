@@ -165,6 +165,16 @@ public class Broker {
             Subscription sub = subscriptions.get(subId);
             if (sub == null) return;
 
+            // Fast path: if we own ALL predicates for this subscription, no need
+            // to involve peers at all. Deliver the notification directly.
+            // This is the common case in 100%-equality scenarios where every
+            // sub has a single predicate on a single field owned by one broker,
+            // and avoids a 10k×2-peer envelope fan-out per publication.
+            if (ps.size() == sub.getPredicatesCount()) {
+                deliverNotification(sub, pub);
+                return;
+            }
+
             String corrId = pub.getId() + ":" + subId;
 
             PartialMatch pm = PartialMatch.newBuilder()
@@ -195,7 +205,9 @@ public class Broker {
                 PersistentSender.send(peer.host(), peer.port(), env);
             }
 
-            // Check if we already have all votes (all brokers that hold predicates for this sub)
+            // We are the coordinator (entry broker for this publication).
+            // Only the coordinator delivers the final notification once all
+            // votes arrive — peers must NOT deliver (handlePartialMatch enforces).
             checkAndDeliver(corrId, state);
         });
     }
@@ -220,23 +232,49 @@ public class Broker {
         // Check if WE have predicates for this subscription
         List<Predicate> myPs = myPredicates.get(pm.getSubscriptionId());
 
-        PartialMatchState state = partialMatches.computeIfAbsent(corrId,
-                k -> new PartialMatchState(sub, pm.getPublication()));
-
-        // If we have predicates, check them and vote
+        // If we have predicates, evaluate them. The PartialMatch envelope
+        // carries the publication content so we can match without lookup.
+        // We DO NOT deliver from this handler — only the coordinator (the
+        // broker that received the PUBLICATION) delivers, to prevent the
+        // duplicate-notification storm that previously fan-out a single
+        // publication into 3x notifications.
         if (myPs != null && !myPs.isEmpty()) {
             boolean myMatch = myPs.stream().allMatch(p -> matchPredicate(pm.getPublication(), p));
-            if (!myMatch) {
-                partialMatches.remove(corrId); // no match — discard
-                return;
-            }
-            state.addVote(id, ownedFields);
-        } else {
-            // We hold no predicates for this sub — we're just forwarding votes
-            state.addExternalVote(pm.getMatchedFieldsList());
-        }
+            if (!myMatch) return;
 
-        checkAndDeliver(corrId, state);
+            // Send back a PartialMatch (vote) to the coordinator so it can
+            // tally votes and deliver once all predicates are matched.
+            // Reusing PartialMatch envelope shape: the sender field tells the
+            // coordinator which broker is voting.
+            PartialMatch ack = PartialMatch.newBuilder()
+                    .setPublicationId(pm.getPublicationId())
+                    .setSubscriptionId(pm.getSubscriptionId())
+                    .setSubscriberId(pm.getSubscriberId())
+                    .addAllMatchedFields(ownedFields.stream()
+                            .filter(f -> myPs.stream().anyMatch(p -> p.getField().equals(f)))
+                            .toList())
+                    .setPublication(pm.getPublication())
+                    .setEmitTimestamp(pm.getEmitTimestamp())
+                    .build();
+            Envelope env = Envelope.newBuilder()
+                    .setType(Envelope.Type.PARTIAL_MATCH)
+                    .setSenderId(id)
+                    .setCorrelationId(corrId)
+                    .setPartialMatch(ack)
+                    .build();
+            // Route the vote to the coordinator (the original sender of pm).
+            for (Config.BrokerAddress peer : peers) {
+                // Skip self; only forward to the broker that originated the PartialMatch.
+                // The coordinator collects votes via partialMatches.
+                PersistentSender.send(peer.host(), peer.port(), env);
+            }
+        } else {
+            // No predicates here — we're the coordinator receiving a peer's vote.
+            PartialMatchState state = partialMatches.computeIfAbsent(corrId,
+                    k -> new PartialMatchState(sub, pm.getPublication()));
+            state.addExternalVote(pm.getMatchedFieldsList());
+            checkAndDeliver(corrId, state);
+        }
     }
 
     private void checkAndDeliver(String corrId, PartialMatchState state) {
