@@ -1,0 +1,101 @@
+syntax = "proto3";
+option java_package = "ebs.proto";
+option java_outer_classname = "EbsProto";
+
+// ── Publication ───────────────────────────────────────────────────────────────
+message Publication {
+    string  id        = 1;   // UUID
+    string  company   = 2;
+    double  value     = 3;
+    double  drop      = 4;
+    double  variation = 5;
+    string  date      = 6;   // ISO format: yyyy-MM-dd
+    int64   timestamp = 7;   // epoch millis, set by publisher
+    // Encrypted variant (bonus)
+    bytes   encrypted_payload = 8;
+    bool    is_encrypted      = 9;
+}
+
+// ── Subscription predicate ────────────────────────────────────────────────────
+message Predicate {
+    string field    = 1;
+    string operator = 2;   // =, !=, <, <=, >, >=
+    string value    = 3;
+    // Encrypted variant (bonus)
+    bytes  hashed_field = 4;
+    bytes  hashed_value = 5;
+}
+
+// ── Subscription ─────────────────────────────────────────────────────────────
+message Subscription {
+    string            id            = 1;   // UUID
+    string            subscriber_id = 2;
+    repeated Predicate predicates   = 3;
+    bool              is_encrypted  = 4;
+}
+
+// ── Notification sent to subscriber ──────────────────────────────────────────
+message Notification {
+    string      subscription_id = 1;
+    Publication publication     = 2;
+    int64       delivery_time   = 3;   // epoch millis
+}
+
+// ── Envelope: all messages between nodes use this wrapper ─────────────────────
+message Envelope {
+    enum Type {
+        PUBLICATION        = 0;
+        SUBSCRIPTION       = 1;
+        NOTIFICATION       = 2;
+        HEARTBEAT          = 3;
+        PARTIAL_MATCH      = 4;   // broker-to-broker coordination
+        BROKER_STATE       = 5;   // fault tolerance: state replication
+        ACK                = 6;
+    }
+    Type   type          = 1;
+    string sender_id     = 2;
+    string correlation_id = 3;   // ties partial matches together
+
+    oneof payload {
+        Publication  publication  = 4;
+        Subscription subscription = 5;
+        Notification notification = 6;
+        Heartbeat    heartbeat    = 7;
+        PartialMatch partial_match = 8;
+        BrokerState  broker_state  = 9;
+        Ack          ack           = 10;
+    }
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+message Heartbeat {
+    string broker_id = 1;
+    int64  timestamp = 2;
+    int32  sub_count = 3;
+}
+
+// ── Partial match: broker tells others which predicates matched ───────────────
+message PartialMatch {
+    string       publication_id   = 1;
+    string       subscription_id  = 2;
+    string       subscriber_id    = 3;
+    repeated string matched_fields = 4;
+    Publication  publication      = 5;
+    int64        emit_timestamp   = 6;
+}
+
+// ── Broker state snapshot for replication ─────────────────────────────────────
+// `subscriber_addrs` is parallel to `subscriptions` (same index → same sub),
+// allowing peer brokers to deliver notifications when they participate in
+// pipelined matching for replicated subscriptions.
+message BrokerState {
+    string                  broker_id        = 1;
+    repeated Subscription   subscriptions    = 2;
+    repeated string         subscriber_addrs = 3;
+}
+
+// ── ACK ───────────────────────────────────────────────────────────────────────
+message Ack {
+    string ref_id  = 1;
+    bool   success = 2;
+}

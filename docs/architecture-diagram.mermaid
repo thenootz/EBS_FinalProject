@@ -1,0 +1,53 @@
+%% ──────────────────────────────────────────────────────────────────────────
+%%  EBS Pub/Sub — Architecture Diagram
+%%  Component diagram showing publishers, brokers, subscribers + data flow
+%% ──────────────────────────────────────────────────────────────────────────
+
+graph TB
+    subgraph Publishers["Publisher Layer"]
+        P1[pub-1<br/>Protobuf emitter]
+        P2[pub-2<br/>Protobuf emitter]
+    end
+
+    subgraph BrokerOverlay["Broker Overlay (3 nodes)"]
+        B1[broker-1<br/>port 5001<br/>owns: value]
+        B2[broker-2<br/>port 5002<br/>owns: variation, date]
+        B3[broker-3<br/>port 5003<br/>owns: company, drop]
+    end
+
+    subgraph Subscribers["Subscriber Layer"]
+        S1[sub-1<br/>port 7001]
+        S2[sub-2<br/>port 7002]
+        S3[sub-3<br/>port 7003]
+    end
+
+    %% Publications: each publisher → all brokers
+    P1 -.->|Publication<br/>Envelope| B1
+    P1 -.->|Publication<br/>Envelope| B2
+    P1 -.->|Publication<br/>Envelope| B3
+    P2 -.->|Publication<br/>Envelope| B1
+    P2 -.->|Publication<br/>Envelope| B2
+    P2 -.->|Publication<br/>Envelope| B3
+
+    %% Broker overlay: heartbeats + partial match coordination
+    B1 <-->|PartialMatch<br/>Heartbeat<br/>BrokerState| B2
+    B2 <-->|PartialMatch<br/>Heartbeat<br/>BrokerState| B3
+    B1 <-->|PartialMatch<br/>Heartbeat<br/>BrokerState| B3
+
+    %% Subscriptions: subscribers → random broker entry point
+    S1 -->|Subscription| B1
+    S2 -->|Subscription| B2
+    S3 -->|Subscription| B3
+
+    %% Notifications: broker that finalizes match → subscriber
+    B1 -.->|Notification| S1
+    B2 -.->|Notification| S2
+    B3 -.->|Notification| S3
+
+    classDef pub fill:#e1f5ff,stroke:#0288d1,color:#000
+    classDef broker fill:#fff4e1,stroke:#f57c00,color:#000
+    classDef sub fill:#e8f5e9,stroke:#388e3c,color:#000
+
+    class P1,P2 pub
+    class B1,B2,B3 broker
+    class S1,S2,S3 sub

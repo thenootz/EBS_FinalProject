@@ -1,0 +1,44 @@
+%% ──────────────────────────────────────────────────────────────────────────
+%%  EBS Pub/Sub — Fault Tolerance Sequence Diagram
+%%  Shows broker failure detection and subscription recovery
+%% ──────────────────────────────────────────────────────────────────────────
+
+sequenceDiagram
+    autonumber
+    participant B1 as broker-1
+    participant B2 as broker-2 (will fail)
+    participant B3 as broker-3
+    participant S as Subscriber
+
+    Note over B1,B3: NORMAL OPERATION (every 2s)
+    B1->>B2: Heartbeat
+    B1->>B3: Heartbeat
+    B2->>B1: Heartbeat
+    B2->>B3: Heartbeat
+    B3->>B1: Heartbeat
+    B3->>B2: Heartbeat
+
+    Note over B2: At any time, each broker replicates<br/>new subscriptions to peers
+    S->>B2: Subscription
+    B2->>B1: BrokerState(replicate subscription)
+    B2->>B3: BrokerState(replicate subscription)
+
+    Note over B2: t=10s: broker-2 CRASHES
+    B2--xB2: process killed
+
+    Note over B1,B3: t=10s to t=40s — no heartbeats from broker-2
+    loop every 2s
+        B1->>B1: lastHeartbeat[broker-2] = 8s ago...<br/>then 10s, 20s, 30s
+        B3->>B3: same observation
+    end
+
+    Note over B1,B3: t=40s: timeout (30s) exceeded
+    B1->>B1: ⚠ broker-2 marked DEAD<br/>router.removeBroker("broker-2")
+    B3->>B3: ⚠ broker-2 marked DEAD<br/>router.removeBroker("broker-2")
+
+    Note over B1,B3: Absorb replicated subscriptions
+    B1->>B1: absorbFailedBroker(broker-2)<br/>→ takes over predicates for fields<br/>previously owned by broker-2
+    B3->>B3: same
+
+    Note over S,B3: System continues delivering notifications
+    Note over B1,B3: All "variation" and "date" predicates<br/>now handled by broker-1 or broker-3<br/>(based on new consistent hash)

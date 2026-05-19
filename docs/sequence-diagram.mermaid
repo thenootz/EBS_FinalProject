@@ -1,0 +1,45 @@
+%% ──────────────────────────────────────────────────────────────────────────
+%%  EBS Pub/Sub — Sequence Diagram (PartialMatch coordination)
+%%  Shows how a publication is matched against a distributed subscription
+%% ──────────────────────────────────────────────────────────────────────────
+
+sequenceDiagram
+    autonumber
+    participant P as Publisher
+    participant B1 as broker-1<br/>(owns: value)
+    participant B2 as broker-2<br/>(owns: variation, date)
+    participant B3 as broker-3<br/>(owns: company, drop)
+    participant S as Subscriber
+
+    Note over S,B3: PHASE 1 — Subscription Registration<br/>Subscription: {(company,=,Google), (value,>=,90), (variation,<,0.8)}
+    S->>B1: Subscription envelope (entry point)
+    B1->>B1: Filter predicates for owned fields<br/>(keeps "value")
+    B1->>B2: Replicate full Subscription
+    B1->>B3: Replicate full Subscription
+    B2->>B2: Filter for owned fields<br/>(keeps "variation")
+    B3->>B3: Filter for owned fields<br/>(keeps "company")
+
+    Note over P,S: PHASE 2 — Publication Matching
+    P->>B1: Publication envelope
+    P->>B2: Publication envelope
+    P->>B3: Publication envelope
+
+    Note over B1,B3: Each broker evaluates ONLY its owned predicates
+    B1->>B1: matches(pub.value, >=, 90)?  ✓
+    B2->>B2: matches(pub.variation, <, 0.8)?  ✓
+    B3->>B3: matches(pub.company, =, Google)?  ✓
+
+    Note over B1,B3: Each sends PartialMatch with correlationId = pubId:subId
+    B1->>B2: PartialMatch{matched: [value]}
+    B1->>B3: PartialMatch{matched: [value]}
+    B2->>B1: PartialMatch{matched: [variation]}
+    B2->>B3: PartialMatch{matched: [variation]}
+    B3->>B1: PartialMatch{matched: [company]}
+    B3->>B2: PartialMatch{matched: [company]}
+
+    Note over B1,B3: Each broker aggregates votes by correlationId
+    B1->>B1: votes = {value, variation, company}<br/>predicates total = 3 → COMPLETE
+
+    Note over B1,S: PHASE 3 — Notification Delivery
+    B1->>S: Notification(publication, deliveryTime)
+    S->>S: latency = deliveryTime - pub.timestamp

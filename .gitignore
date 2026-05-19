@@ -1,0 +1,54 @@
+# ── Build output ──────────────────────────────────────────────────────────────
+target/
+out/
+build/
+bin/
+*.class
+*.jar
+!lib/*.jar
+
+# ── Generated sources (regenerated from src/main/proto) ───────────────────────
+src/main/java/ebs/proto/
+
+# ── Maven ─────────────────────────────────────────────────────────────────────
+.mvn/
+.m2/
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.project
+.classpath
+.settings/
+.factorypath
+nbproject/
+nbactions.xml
+nb-configuration.xml
+
+# ── OS junk ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs & runtime ────────────────────────────────────────────────────────────
+*.log
+logs/
+hs_err_pid*.log
+replay_pid*.log
+*.pid
+
+# ── Evaluation artefacts ──────────────────────────────────────────────────────
+eval-results.csv
+eval-results-*.csv
+*.tmp
+*.bak
+*.swp
