@@ -8,7 +8,6 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Broker node in the pub/sub overlay network.
@@ -83,7 +82,7 @@ public class Broker {
     public void start() throws IOException {
         serverSocket = new ServerSocket();
         serverSocket.setReuseAddress(true);
-        serverSocket.bind(new java.net.InetSocketAddress(port));
+        serverSocket.bind(new java.net.InetSocketAddress(port), 1024);
         System.out.printf("[%s] listening on port %d%n", id, port);
 
         // Accept connections in a thread pool

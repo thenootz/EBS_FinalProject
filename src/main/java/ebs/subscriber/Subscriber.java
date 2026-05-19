@@ -8,7 +8,6 @@ import ebs.proto.EbsProto.*;
 import java.io.*;
 import java.net.*;
 import java.util.*;
-import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
 /**
@@ -50,7 +49,7 @@ public class Subscriber {
     public void startListening() throws IOException {
         serverSocket = new ServerSocket();
         serverSocket.setReuseAddress(true);
-        serverSocket.bind(new java.net.InetSocketAddress(listenPort));
+        serverSocket.bind(new java.net.InetSocketAddress(listenPort), 1024);
         Thread t = new Thread(this::acceptLoop, id + "-listener");
         t.setDaemon(true);
         t.start();
@@ -69,24 +68,35 @@ public class Subscriber {
     }
 
     private void handleNotification(Socket socket) {
+        // Broker uses a single PersistentSender connection per (host,port)
+        // and streams MANY notifications over it. We must loop until EOF —
+        // closing after one envelope would force the broker to reconnect for
+        // every notification, saturating the accept queue under load.
         try (socket) {
-            Envelope env = NetUtil.receive(socket.getInputStream());
-            if (env == null || env.getType() != Envelope.Type.NOTIFICATION) return;
+            socket.setSoTimeout(60_000);
+            InputStream in = socket.getInputStream();
+            Envelope env;
+            while ((env = NetUtil.receive(in)) != null) {
+                if (env.getType() != Envelope.Type.NOTIFICATION) continue;
 
-            Notification notif = env.getNotification();
-            Publication  pub   = notif.getPublication();
+                Notification notif = env.getNotification();
+                Publication  pub   = notif.getPublication();
 
-            // Decrypt if needed
-            if (useEncryption && pub.getIsEncrypted()) {
-                pub = crypto.decryptPublication(pub);
+                // Decrypt if needed
+                if (useEncryption && pub.getIsEncrypted()) {
+                    pub = crypto.decryptPublication(pub);
+                }
+
+                long latency = notif.getDeliveryTime() - pub.getTimestamp();
+                notificationsReceived.incrementAndGet();
+                totalLatencyMs.addAndGet(Math.max(0, latency));
             }
-
-            long latency = notif.getDeliveryTime() - pub.getTimestamp();
-            notificationsReceived.incrementAndGet();
-            totalLatencyMs.addAndGet(Math.max(0, latency));
-
         } catch (IOException e) {
-            System.err.println("[" + id + "] notification error: " + e.getMessage());
+            if (running) {
+                String msg = e.getMessage();
+                System.err.println("[" + id + "] notification stream closed: "
+                        + (msg == null ? e.getClass().getSimpleName() : msg));
+            }
         }
     }
 
@@ -98,9 +108,6 @@ public class Subscriber {
      * via the ConsistentHashRouter on the broker side.
      */
     public void registerSubscriptions(int count, SubscriptionGenerator gen) {
-        ConsistentHashRouter router = new ConsistentHashRouter(
-                brokers.stream().map(Config.BrokerAddress::id).toList());
-
         for (int i = 0; i < count; i++) {
             Subscription sub = gen.next(id);
 
