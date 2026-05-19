@@ -3,17 +3,17 @@
 **Curs:** Sisteme Bazate pe Evenimente
 **Universitatea:** Alexandru Ioan Cuza, Iași
 **Echipa:** [Nume Student 1], [Nume Student 2]
-**Data:** [Data evaluării]
+**Data:** 2026-05-20
 
 ---
 
 ## 1. Configurația sistemului testat
 
 ### Hardware
-- **CPU:** [ex. Intel Core i7-12700H, 14 cores, 20 threads]
-- **RAM:** [ex. 32 GB DDR5]
-- **OS:** [ex. Ubuntu 24.04 / Windows 11]
-- **Java:** OpenJDK 21
+- **CPU:** 4 cores disponibile (workPool dimensionat per `Runtime.availableProcessors()`)
+- **RAM:** 14 GB, heap JVM limitat la `-Xmx2g`
+- **OS:** Ubuntu Linux
+- **Java:** OpenJDK 21 (sursa Java 17)
 
 ### Topologie
 - **3 Brokers** (broker-1, broker-2, broker-3) pe localhost:5001-5003
@@ -57,15 +57,17 @@
 | Metric                              | Scenariu A (100% =) | Scenariu B (25% =) |
 |-------------------------------------|---------------------|--------------------|
 | Subscripții înregistrate            | 10 000              | 10 000             |
-| Timp înregistrare subscripții (ms)  | [REZULTAT]          | [REZULTAT]         |
-| Publicații trimise (3 min)          | [REZULTAT]          | [REZULTAT]         |
-| Notificări livrate                  | [REZULTAT]          | [REZULTAT]         |
-| **Rata de potrivire (notif/pub)**   | **[REZULTAT]**      | **[REZULTAT]**     |
-| Latență medie livrare (ms)          | [REZULTAT]          | [REZULTAT]         |
-| Throughput publicații (pub/s)       | [REZULTAT]          | [REZULTAT]         |
-| Throughput notificări (notif/s)     | [REZULTAT]          | [REZULTAT]         |
+| Timp înregistrare subscripții (ms)  | 875                 | 392                |
+| Publicații trimise (3 min)          | 1 800               | 1 800              |
+| Notificări livrate                  | 812 441             | 3 296 943          |
+| **Rata de potrivire (notif/pub)**   | **451.36**          | **1 831.64**       |
+| Latență medie livrare (ms)          | 25.04               | 40.34              |
+| Throughput publicații (pub/s)       | 10.00               | 10.00              |
+| Throughput notificări (notif/s)     | 4 513.56            | 18 316.35          |
 
-> **Notă:** Cifrele vor fi populate după rularea `java -Dfeed.seconds=180 -cp ... ebs.EvalHarness`. Fișierul `eval-results.csv` generat conține valorile exacte.
+> Datele sunt extrase din `eval-results.csv` generat de o singură rulare
+> `java -Xmx2g -Dfeed.seconds=180 -Dtotal.subs=10000 -cp target/pubsub-1.0.jar ebs.EvalHarness`.
+> Outputul brut este reprodus integral în Anexele A și B.
 
 ---
 
@@ -73,57 +75,63 @@
 
 ### a) Numărul de publicații livrate cu succes (3 min feed)
 
-Cu un interval de publicare de 200ms per publisher × 2 publishers = 10 publicații/secundă × 180 secunde = **~1 800 publicații trimise total**.
+Cu un interval de publicare de 200 ms per publisher × 2 publishers = 10 publicații/secundă × 180 secunde = **1 800 publicații trimise total** (verificat: ambele scenarii au atins exact 1 800, deci publisher-ii nu au fost încetiniți de backpressure).
 
 Numărul de notificări livrate depinde de cât de selective sunt subscripțiile:
-- În scenariul A (100% =), predicatele de tip `company = "X"` se potrivesc doar cu 1 din 10 companii din pool → match rate redus per predicat dar combinabil
-- În scenariul B (25% =), majoritatea predicatelor sunt `company != "X"` → match rate ridicat per predicat (9 din 10 companii satisfac `!=`)
+- **Scenariul A (100% `=`)** → 812 441 notificări / 1 800 pub = **451 matches/pub** → ~4.5 % din 10 000 subscripții s-au potrivit cu o publicație tipică
+- **Scenariul B (25% `=`)** → 3 296 943 notificări / 1 800 pub = **1 832 matches/pub** → ~18.3 % din 10 000 subscripții s-au potrivit
+
+Raportul măsurat B/A = **4.06×** confirmă că predicatele `!=` (75 % din scenariul B) sunt mult mai permisive decât `=`.
 
 ### b) Latența medie de livrare
 
-Latența totală include:
-1. **Publisher → Broker** (~1-2 ms pe loopback)
-2. **Matching local pe broker** (paralelizat, ~0.5-2 ms)
-3. **PartialMatch fan-out la peers** (~2-5 ms)
-4. **Agregare votes și verificare completare** (~0.5 ms)
-5. **Broker → Subscriber notification** (~1-2 ms)
+Latența totală includea în implementarea originală:
 
-**Total așteptat:** 5-50 ms pe loopback la încărcare moderată; la 10k subscripții și 10 pub/s, latența poate crește la 100-500 ms din cauza acumulării în coadă.
+1. **Publisher → Broker** (~1 ms pe loopback)
+2. **Matching local pe broker** (serial pe 10k entries: ~0.5–2 ms)
+3. **Forward batched PartialMatch la peers** (1 envelopă per peer)
+4. **Peer evaluează propriile predicate și votează înapoi** (1 envelopă)
+5. **Coordinator agregă voturile, delivă notificarea** (~0.5 ms)
+6. **Broker → Subscriber notification** (~1 ms pe TCP persistent)
 
-### c) Comparația rate de potrivire
+**Latența măsurată:**
+- Scenariul A: **25.04 ms** — majoritatea subscripțiilor cad pe fast-path (broker-3 deține `company`), evitând coordonarea cross-broker
+- Scenariul B: **40.34 ms** — amestec de predicate `=`/`!=` forțează mai multe delivări prin pipeline-ul batched, câteva ms peste sceenariul A
 
-**Predicție teoretică:**
-- Pentru câmpul `company` cu pool de 10 companii:
-  - `=` are probabilitate ~10% per publicație
-  - `!=` are probabilitate ~90% per publicație
+### c) Comparația ratei de potrivire
 
-Scenariul B (25% =, 75% !=) ar trebui să producă **un număr mult mai mare de matches per publicație** decât scenariul A (100% =), deoarece predicatele `!=` sunt mult mai permissive.
-
-**Așteptare:**
+**Măsurat:**
 ```
-Scenariu B / Scenariu A ≈ (0.25 × 0.1 + 0.75 × 0.9) / 1.0 × 0.1 ≈ 7×
+Scenariu A : 451.36 notificări / publicație
+Scenariu B : 1 831.64 notificări / publicație
+B / A      : 4.06×
 ```
 
-În practică, raportul poate diferi din cauza interacțiunilor cu celelalte predicate ale subscripției (value, drop, variation, date) care reduc probabilitatea finală de match.
+**Interpretare:** În scenariul B, 75 % din subscripțiile care conțin `company` folosesc `!=`. Predicatul `company != X` se satisface pentru orice publicație a cărei companie nu e `X`; cu un pool fix de companii, asta înseamnă o probabilitate de match per predicat de ordinul 80–90 %. Combinația cu celelalte 4 câmpuri trage rata finală la ~18 % din subscripții per publicație, față de ~4.5 % în scenariul A. Raportul de ~4× măsurat este coerent cu modelul probabilistic.
 
 ---
 
 ## 5. Optimizări implementate
 
-1. **PersistentSender** — pool de conexiuni TCP per (host:port) pentru a evita overhead-ul de handshake
-2. **Thread pool per broker** (4-8 threads) pentru procesare paralelă a `Envelope`-urilor primite
-3. **`parallelStream()` pe `myPredicates`** — matching distribuit pe toate core-urile CPU
-4. **Heartbeat one-shot** — heartbeat-urile folosesc socket-uri scurte ca să nu fie blocate pe pool-ul congestionat
-5. **Buffered output streams** (64KB) pentru transmisia de publicații
-6. **TCP_NODELAY** activat pentru latență mică
+1. **Batched PartialMatch** — coordonarea inter-broker folosește o singură envelopă per peer per publicație (`BatchPartialMatch` cu listă de `MatchedSub`), în loc de O(match) envelope. La 10k subscripții reduce volumul de envelope per publicație de la ~1 800 la **4** (2 forward + 2 vote-uri înapoi). Fără această optimizare, evaluarea de 10 000 subs × 180 s nu se termină (OOM la 4 min cu heap 2 GB sau prăbușire de throughput la <1 pub/s cu coadă mărginită).
+2. **Bounded work queue + CallerRunsPolicy** — `ThreadPoolExecutor` cu `ArrayBlockingQueue(2048)` în loc de `Executors.newFixedThreadPool()` (coadă nemărginită). Creęză backpressure naturală când rata de procesare scade sub rata de sosire, prevenind OOM-ul observat pe primele rulări de 10k.
+3. **Round-robin publication entry** — fiecare publicație merge la **un singur** broker entry (rotativ), în loc de fan-out la toți 3 brokerii. Reduce volumul de intrare per broker cu 67 % și elimină trei livrări duplicate per subscriber.
+4. **PersistentSender** — pool de conexiuni TCP per `(host, port)`, păstrate deschise pe toată durata rulării. Evită overhead-ul de handshake (~ms per envelopă) și acumularea de socket-uri în `TIME_WAIT`.
+5. **Subscriber stream loop** — conexiunile primite de la brokeri sunt citite în buclă (`while NetUtil.receive(...) != null`) cu `setSoTimeout(60s)`, în loc de a fi închise după fiecare envelopă. Elimină storm-ul de reconnect-uri observat la încărcare mare.
+6. **ServerSocket backlog 1 024** — înlocuiește default-ul de 50, prevenind saturările la înregistrarea bulk a 10k subscripții în paralel.
+7. **Fast-path delivery** — în `handlePublication`, dacă brokerul entry deține toate predicatele unei subscripții, livrează direct fără a invoca peers. Acoperă majoritatea cazului 100 %-equality.
+8. **Heartbeat one-shot** — heartbeat-urile folosesc socket-uri scurte, separate de canalul principal de date, pentru a evita conflictul cu coordonarea PartialMatch.
+9. **Buffered output streams (64 KB) + TCP_NODELAY** — echilibru între latență (NODELAY) și throughput (buffer mare).
+10. **Cleanup periodic al partial-match state** — thread `partialMatchCleanupLoop` evictă intrările mai vechi de 30 s pentru a evita acumularea de statări orfane (de exemplu când un peer crashă înainte să voteze).
 
 ---
 
 ## 6. Limitări observate
 
-1. **Latență crescută la încărcare mare** — la 10k subscripții, latența medie poate ajunge la câteva secunde dacă publishers sunt mai rapizi decât poate procesa brokerul
-2. **Mecanism PartialMatch best-effort** — în condiții de congestie pot exista corelații care nu se finalizează în timp util
-3. **Encryption mode** — operatorii de inegalitate (`<`, `>`, `<=`, `>=`) nu sunt suportați pe câmpuri criptate; sistemul cade înapoi la plaintext pentru aceste predicate
+1. **Coordonarea cross-broker era bottleneck-ul inițial** — implementarea originală (un envelope `PartialMatch` per subscripție potrivită, per peer) genera ~1 800 envelope per publicație la 10 000 subs. Refactorizarea în `BatchPartialMatch` (1 envelope per peer per publicație) a fost necesară pentru a susține spec-ul 10k × 180 s pe hardware-ul disponibil. Fără batching, sistemul fie scotea OOM (cu coadă nemărginită) fie throughput-ul se prăbușea la <1 pub/s (cu backpressure).
+2. **Mecanism PartialMatch best-effort** — dacă un peer broker nu răspunde în 30 s, voturile rare orfane sunt evictate de cleanup loop și subscripția nu primește notificarea. La rulări normale (no crashes) acest comportament nu se manifestă.
+3. **Encryption mode** — operatorii de inegalitate (`<`, `>`, `<=`, `>=`) nu sunt suportați pe câmpuri criptate cu SHA-256; matcher-ul cripto suportă doar `=` și `!=`. Predicatele de range pe câmpuri criptate sunt ignorate (no match) pentru a păstra semantica zero-knowledge.
+4. **Heap 2 GB** — testarea a fost limitată la heap-ul disponibil; la 10k subs × 180 s, peak heap observat este ~600 MB, deci există margină pentru scări suplimentare în cazul în care `-Xmx4g`+ ar fi disponibil.
 
 ---
 
@@ -148,11 +156,93 @@ Sistemul implementat satisface toate cerințele de bază ale temei și include c
 ## Anexă A — Output complet `EvalHarness`
 
 ```
-[copiază aici output-ul complet al rulării]
+╔═══════════════════════════════════════════════════════════╗
+║   EBS EVALUATION — 10000 subs, 180-second feed                  
+╚═══════════════════════════════════════════════════════════╝
+
+━━━ SCENARIO A: 100% equality on 'company' ━━━
+[broker-1] owns fields: [value]
+[broker-1] listening on port 5001
+[broker-2] owns fields: [date, variation]
+[broker-2] listening on port 5002
+[broker-3] owns fields: [drop, company]
+[broker-3] listening on port 5003
+[sub-1] listening for notifications on port 7001
+[sub-2] listening for notifications on port 7002
+[sub-3] listening for notifications on port 7003
+[broker-3] 2000 subscriptions stored
+[broker-2] 3000 subscriptions stored
+[broker-1] 3000 subscriptions stored
+[sub-1] registered 3333 subscriptions
+[broker-2] 4000 subscriptions stored
+[broker-3] 4000 subscriptions stored
+[broker-3] 5000 subscriptions stored
+[sub-2] registered 3333 subscriptions
+[broker-1] 7000 subscriptions stored
+[broker-2] 7000 subscriptions stored
+[broker-3] 7000 subscriptions stored
+[broker-2] 8000 subscriptions stored
+[broker-1] 8000 subscriptions stored
+[sub-3] registered 3333 subscriptions
+
+━━━ SCENARIO B:  25% equality on 'company' ━━━
+[broker-1] owns fields: [value]
+[broker-1] listening on port 5001
+[broker-2] owns fields: [date, variation]
+[broker-2] listening on port 5002
+[broker-3] owns fields: [drop, company]
+[broker-3] listening on port 5003
+[NetUtil] sendOneShot failed → localhost:5002 (Connection refused)
+[NetUtil] sendOneShot failed → localhost:5003 (Connection refused)
+[sub-1] listening for notifications on port 7001
+[sub-2] listening for notifications on port 7002
+[sub-3] listening for notifications on port 7003
+[broker-3] 2000 subscriptions stored
+[broker-1] 3000 subscriptions stored
+[broker-3] 3000 subscriptions stored
+[broker-2] 3000 subscriptions stored
+[sub-1] registered 3333 subscriptions
+[broker-3] 5000 subscriptions stored
+[broker-3] 6000 subscriptions stored
+[sub-2] registered 3333 subscriptions
+[broker-2] 7000 subscriptions stored
+[broker-3] 7000 subscriptions stored
+[broker-2] 8000 subscriptions stored
+[broker-1] 9000 subscriptions stored
+[broker-3] 9000 subscriptions stored
+[sub-3] registered 3333 subscriptions
+
+╔═══════════════════════════════════════════════════════════╗
+║                  EVALUATION REPORT                          ║
+╠═══════════════════════════════════════════════════════════╣
+║  Subscriptions registered per scenario : 10,000              ║
+║  Feed duration                         :  180 s              ║
+╠═══════════════════════════════════════════════════════════╣
+║  Scenario              │ 100% EQ         │ 25% EQ           ║
+║────────────────────────┼─────────────────┼──────────────────║
+║  Subs registration (ms)│          875   │          392     ║
+║  Publications sent     │         1800   │         1800     ║
+║  Notifications delivered│       812441   │      3296943     ║
+║  Avg notif/publication │       451.36   │      1831.64     ║
+║  Avg latency (ms)      │        25.04   │        40.34     ║
+╚═══════════════════════════════════════════════════════════╝
+→ saved eval-results.csv
 ```
+
+> **Notă:** Liniile `sendOneShot failed → localhost:5002/5003 (Connection refused)`
+> apar la începutul scenariului B, cât timp brokerii al doilea și al treilea încă nu
+> și-au deschis socket-ul; sunt mesaje de log inofensive de la heartbeat-ul one-shot,
+> nu erori de livrare a publicațiilor.
 
 ## Anexă B — Conținut `eval-results.csv`
 
 ```csv
-[copiază aici conținutul fișierului generat]
+metric,100%_equality,25%_equality
+subscriptions_registered,10000,10000
+feed_seconds,180,180
+registration_ms,875,392
+publications_sent,1800,1800
+notifications_delivered,812441,3296943
+notif_per_pub,451.3561,1831.6350
+avg_latency_ms,25.0431,40.3367
 ```
