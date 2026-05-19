@@ -151,8 +151,10 @@ public class Broker {
 
     private void handlePublication(Publication pub) {
         // For each subscription this broker holds predicates for,
-        // check if OUR predicates match — parallel for high throughput
-        myPredicates.entrySet().parallelStream().forEach(entry -> {
+        // check if OUR predicates match. Serial stream avoids the per-publication
+        // ForkJoinPool task explosion (10k entries x N pub/s) that GC-thrashes the heap.
+        // The broker workPool already provides connection-level parallelism upstream.
+        myPredicates.entrySet().stream().forEach(entry -> {
             String subId       = entry.getKey();
             List<Predicate> ps = entry.getValue();
 

@@ -19,6 +19,11 @@ public class Publisher {
 
     public final AtomicLong pubsSent = new AtomicLong();
     private volatile boolean running = false;
+    // Round-robin index for selecting one entry broker per publication.
+    // Each publication is routed to a single entry broker; that broker
+    // coordinates pipeline matching across its peers (see Broker.handlePublication).
+    // Sending to all brokers would triple the inbound load and cause duplicate fan-out.
+    private long pubCounter = 0;
 
     public Publisher(String id, List<Config.BrokerAddress> brokers,
                      boolean useEncryption, CryptoService crypto) {
@@ -66,8 +71,9 @@ public class Publisher {
                 .setCorrelationId(pub.getId())
                 .setPublication(toSend)
                 .build();
-        for (Config.BrokerAddress broker : brokers) {
-            PersistentSender.send(broker.host(), broker.port(), env);
-        }
+        // Send to a single entry broker (round-robin). The receiving broker
+        // runs pipeline matching and forwards PartialMatch envelopes to its peers.
+        Config.BrokerAddress entry = brokers.get((int) (Math.floorMod(pubCounter++, brokers.size())));
+        PersistentSender.send(entry.host(), entry.port(), env);
     }
 }
